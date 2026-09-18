@@ -1,44 +1,86 @@
 name: Fork Sync
 
-permissions:
-    contents: write
-
 on:
-    schedule:
-        - cron: "0 0 * * *"  # 每天午夜执行
-    workflow_dispatch:  # 允许手动触发
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-sync-main
+  cancel-in-progress: false
 
 jobs:
-    sync_with_upstream:
-        name: Sync with Upstream
-        runs-on: ubuntu-latest
-        if: ${{ github.event.repository.fork }}
+  sync_with_upstream:
+    name: Sync with Upstream
+    runs-on: ubuntu-latest
+    if: github.repository == 'Breeeezever/danmu_api'
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          token: ${{ github.token }}
 
-        steps:
-            - name: Checkout target repo
-              uses: actions/checkout@v5
-              with:
-                token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Merge upstream while preserving fork workflows
+        shell: bash
+        run: |
+          set -Eeuo pipefail
 
-            - name: Sync Upstream
-              uses: aormsby/Fork-Sync-With-Upstream-action@v3.4.3
-              with:
-                  target_repo_token: ${{ secrets.GITHUB_TOKEN }}
-                  upstream_sync_repo: huangxd-/danmu_api
-                  upstream_sync_branch: main
-                  target_sync_branch: main
-                  test_mode: false
+          upstream_repo="https://github.com/huangxd-/danmu_api.git"
+          upstream_branch="main"
+          target_branch="main"
 
-            - name: Check for new commits
-              if: success()
-              run: echo "Sync completed successfully"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-            - name: Check for Failure
-              if: failure()
-              run: |
-                  echo "[Error] Sync failed. This might be due to:"
-                  echo "1. Changes in the upstream workflow file"
-                  echo "2. Merge conflicts that need manual resolution"
-                  echo "3. Network issues"
-                  echo "Please check the logs and consider manual sync if needed."
-                  exit 1
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote set-url upstream "${upstream_repo}"
+          else
+            git remote add upstream "${upstream_repo}"
+          fi
+
+          git fetch --prune upstream "${upstream_branch}"
+
+          if git merge-base --is-ancestor "upstream/${upstream_branch}" HEAD; then
+            echo "Fork is already up to date."
+            exit 0
+          fi
+
+          base_head="$(git rev-parse HEAD)"
+          set +e
+          git merge --no-commit --no-ff "upstream/${upstream_branch}"
+          merge_status=$?
+          set -e
+
+          if (( merge_status != 0 )); then
+            conflicts="$(git diff --name-only --diff-filter=U)"
+            non_workflow_conflicts="$(printf '%s\n' "${conflicts}" | grep -v '^\.github/workflows/' | sed '/^$/d' || true)"
+            if [[ -n "${non_workflow_conflicts}" ]]; then
+              echo "Non-workflow merge conflicts require manual review:" >&2
+              printf '%s\n' "${non_workflow_conflicts}" >&2
+              git merge --abort
+              exit 1
+            fi
+          fi
+
+          # GITHUB_TOKEN cannot update workflow files. Keep this fork's workflow
+          # directory unchanged while merging every other upstream change.
+          git rm -r --ignore-unmatch .github/workflows >/dev/null 2>&1 || true
+          if git cat-file -e "${base_head}:.github/workflows" 2>/dev/null; then
+            git checkout "${base_head}" -- .github/workflows
+          fi
+          git add -A .github/workflows
+
+          remaining_conflicts="$(git diff --name-only --diff-filter=U)"
+          if [[ -n "${remaining_conflicts}" ]]; then
+            echo "Unresolved merge conflicts:" >&2
+            printf '%s\n' "${remaining_conflicts}" >&2
+            git merge --abort
+            exit 1
+          fi
+
+          git commit -m "Sync upstream ${upstream_branch} while preserving fork workflows"
+          git push origin "HEAD:${target_branch}"
