@@ -1,44 +1,62 @@
-name: Fork Sync
-
-permissions:
-    contents: write
+name: Sync upstream (anchored)
 
 on:
-    schedule:
-        - cron: "0 0 * * *"  # 每天午夜执行
-    workflow_dispatch:  # 允许手动触发
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream-anchored
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: "huangxd-/danmu_api"
+  UPSTREAM_BRANCH: "main"
 
 jobs:
-    sync_with_upstream:
-        name: Sync with Upstream
-        runs-on: ubuntu-latest
-        if: ${{ github.event.repository.fork }}
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
-        steps:
-            - name: Checkout target repo
-              uses: actions/checkout@v5
-              with:
-                token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Backup anchor (tag current state)
+        run: |
+          TAG="backup/$(date -u +%Y-%m-%d)"
+          if git ls-remote --exit-code origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "Anchor $TAG already exists, skip."
+          else
+            git tag "$TAG"
+            git push origin "$TAG"
+            echo "Anchor created: $TAG -> $(git rev-parse HEAD)"
+          fi
 
-            - name: Sync Upstream
-              uses: aormsby/Fork-Sync-With-Upstream-action@v3.4.3
-              with:
-                  target_repo_token: ${{ secrets.GITHUB_TOKEN }}
-                  upstream_sync_repo: huangxd-/danmu_api
-                  upstream_sync_branch: main
-                  target_sync_branch: main
-                  test_mode: false
+      - name: Guard checks
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM}.git"
+          git fetch upstream "$UPSTREAM_BRANCH"
+          if ! git merge-base HEAD "upstream/$UPSTREAM_BRANCH" >/dev/null 2>&1; then
+            echo "::error::No common ancestor - upstream history may have been rewritten, aborting."; exit 1
+          fi
+          BEFORE=$(git ls-tree -r --name-only HEAD | wc -l)
+          AFTER=$(git ls-tree -r --name-only "upstream/$UPSTREAM_BRANCH" | wc -l)
+          echo "File count: $BEFORE -> $AFTER"
+          if [ "$BEFORE" -gt 5 ] && [ "$AFTER" -lt $((BEFORE * 30 / 100)) ]; then
+            echo "::error::File count dropped sharply $BEFORE -> $AFTER - upstream branch may have been wiped, aborting."; exit 1
+          fi
 
-            - name: Check for new commits
-              if: success()
-              run: echo "Sync completed successfully"
-
-            - name: Check for Failure
-              if: failure()
-              run: |
-                  echo "[Error] Sync failed. This might be due to:"
-                  echo "1. Changes in the upstream workflow file"
-                  echo "2. Merge conflicts that need manual resolution"
-                  echo "3. Network issues"
-                  echo "Please check the logs and consider manual sync if needed."
-                  exit 1
+      - name: Merge upstream (merge-only, never reset)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git merge-base --is-ancestor HEAD "upstream/$UPSTREAM_BRANCH"; then
+            git merge --ff-only "upstream/$UPSTREAM_BRANCH"
+          else
+            git merge --no-ff --no-edit "upstream/$UPSTREAM_BRANCH"
+          fi
+          git push origin "HEAD:${{ github.ref_name }}"
